@@ -1,5 +1,6 @@
-
+# app.py — EPL Excel → Streamlit (with Excel colors/fonts + CF approximation)
 import os
+import re
 import math
 import tempfile
 from pathlib import Path
@@ -8,16 +9,17 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
 
 st.set_page_config(page_title="EPL Workbook Browser", layout="wide")
 
-# Hide these sheets from the UI (case-insensitive names)
-HIDDEN_SHEETS = {"index"}  # add more names here if needed
+HIDDEN_SHEETS = {"index"}   # hide these sheets
 DEFAULT_WORKBOOK = "EPL macro.xlsm"
 
 st.title("EPL Macro Workbook → Web App")
-st.caption("Browse sheets, filter, compute quick stats, chart, or render Excel colors & fonts.")
+st.caption("Filter/search, quick stats, charts, static Excel colors/fonts, and approximate conditional formatting (color scales + simple numeric rules).")
 
+# ---------------------- Data Loading ----------------------
 @st.cache_data(show_spinner=False)
 def load_excel_all_sheets(path_or_file) -> dict:
     dfs = pd.read_excel(path_or_file, sheet_name=None, engine="openpyxl")
@@ -34,40 +36,22 @@ def detect_numeric_cols(df: pd.DataFrame):
 def detect_datetime_cols(df: pd.DataFrame):
     return [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
 
-def apply_text_search(df: pd.DataFrame, query: str):
-    if not query:
-        return df
-    obj_cols = [c for c in df.columns if pd.api.types.is_object_dtype(df[c])]
-    if not obj_cols:
-        return df
-    mask = pd.Series(False, index=df.index)
-    q = query.strip().lower()
-    for c in obj_cols:
-        mask = mask | df[c].astype(str).str.lower().str_contains(q, na=False)
-    return df[mask]
-
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
+# ---------------------- Static Excel formatting helpers ----------------------
 def _argb_to_hex(argb: str) -> str:
-    if not argb:
-        return ""
+    if not argb: return ""
     argb = str(argb)
-    if len(argb) == 8:
-        return "#" + argb[-6:]
-    if len(argb) == 6:
-        return "#" + argb
+    if len(argb) == 8: return "#" + argb[-6:]
+    if len(argb) == 6: return "#" + argb
     return ""
 
 def read_sheet_styles(xlsm_path: str, sheet_name: str):
     wb = load_workbook(xlsm_path, data_only=True)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"Sheet '{sheet_name}' not found.")
     ws = wb[sheet_name]
-
     vals, css = [], []
     max_row, max_col = ws.max_row, ws.max_column
-
     for r in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
         row_vals, row_css = [], []
         for cell in r:
@@ -94,7 +78,6 @@ def read_sheet_styles(xlsm_path: str, sheet_name: str):
             row_css.append("; ".join(css_parts))
         vals.append(row_vals)
         css.append(row_css)
-
     values_df = pd.DataFrame(vals)
     header_row = None
     if len(vals) >= 1:
@@ -121,147 +104,155 @@ def style_dataframe(values_df, css_df):
     styler = styler.set_properties(**{"white-space": "nowrap"})
     return styler
 
-# Sidebar: choose file & sheet
+# ---------------------- Conditional Formatting (approximation) ----------------------
+def a1_to_col_indices(a1_range):
+    m = re.match(r"\$?([A-Z]+)\$?(\d+)?:\$?([A-Z]+)\$?(\d+)?", a1_range)
+    if m:
+        c1, _, c2, _ = m.groups()
+        i1 = column_index_from_string(c1) - 1
+        i2 = column_index_from_string(c2) - 1
+        return list(range(min(i1, i2), max(i1, i2)+1))
+    m2 = re.match(r"\$?([A-Z]+):\$?([A-Z]+)", a1_range)
+    if m2:
+        c1, c2 = m2.groups()
+        i1 = column_index_from_string(c1) - 1
+        i2 = column_index_from_string(c2) - 1
+        return list(range(min(i1, i2), max(i1, i2)+1))
+    m3 = re.match(r"\$?([A-Z]+)\$?\d+", a1_range)
+    if m3:
+        return [column_index_from_string(m3.group(1)) - 1]
+    return []
+
+def parse_cf(ws):
+    out = []
+    cf = ws.conditional_formatting
+    for rng in getattr(cf, "_cf_rules", {}):
+        for rule in cf._cf_rules[rng]:
+            kind = getattr(rule, "type", None) or getattr(rule, "rule_type", None)
+            if kind == "colorScale":
+                cs = getattr(rule, "colorScale", None)
+                if not cs: continue
+                thresholds = []
+                for cfvo, color in zip(cs.cfvo, cs.color):
+                    thresholds.append({
+                        "type": cfvo.type,
+                        "val": cfvo.val,
+                        "color": _argb_to_hex(getattr(color, "rgb", "")),
+                    })
+                out.append({"kind":"colorScale","range":rng,"thresholds":thresholds})
+            elif kind == "cellIs":
+                op = getattr(rule, "operator", None)
+                dxf = getattr(rule, "dxf", None)
+                bg = None
+                if dxf and getattr(dxf, "fill", None):
+                    col = getattr(dxf.fill.fgColor, "rgb", None) or getattr(dxf.fill.start_color, "rgb", None)
+                    if col: bg = _argb_to_hex(col)
+                f_list = getattr(rule, "formula", None) or []
+                out.append({"kind":"cellIs","range":rng,"operator":op,"formula":f_list,"bg":bg})
+    return out
+
+def apply_cf_colors(df, ws):
+    rules = parse_cf(ws)
+    if not rules: return None
+    headers = [cell.value for cell in ws[1]]
+    styler = df.style
+    def affected_cols(a1):
+        ws_cols = a1_to_col_indices(a1)
+        cols = []
+        if len(headers) == len(df.columns):
+            for c in ws_cols:
+                if 0 <= c < len(df.columns):
+                    cols.append(df.columns[c])
+        else:
+            for c in ws_cols:
+                if 0 <= c < len(headers):
+                    hv = headers[c]
+                    if hv is not None and str(hv).strip() in df.columns:
+                        cols.append(str(hv).strip())
+        seen, ordered = set(), []
+        for x in cols:
+            if x in df.columns and x not in seen:
+                seen.add(x); ordered.append(x)
+        return ordered
+    for r in rules:
+        if r["kind"]=="colorScale":
+            cols = []
+            for part in str(r["range"]).split():
+                cols += affected_cols(part)
+            for col in cols:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    styler = styler.background_gradient(axis=None, subset=[col])
+    def mask_series(series, operator, formula_vals):
+        s = pd.to_numeric(series, errors="coerce")
+        try:
+            if operator in ("lessThan","lt"): return s < float(formula_vals[0])
+            if operator in ("lessThanOrEqual","le"): return s <= float(formula_vals[0])
+            if operator in ("greaterThan","gt"): return s > float(formula_vals[0])
+            if operator in ("greaterThanOrEqual","ge"): return s >= float(formula_vals[0])
+            if operator in ("equal","eq"): return s == float(formula_vals[0])
+            if operator == "between": return s.between(float(formula_vals[0]), float(formula_vals[1]), inclusive="both")
+        except: return pd.Series(False, index=series.index)
+        return pd.Series(False, index=series.index)
+    for r in rules:
+        if r["kind"]=="cellIs" and r.get("bg"):
+            cols = []
+            for part in str(r["range"]).split():
+                cols += affected_cols(part)
+            for col in cols:
+                if col in df.columns:
+                    m = mask_series(df[col], r.get("operator"), r.get("formula", []))
+                    css_col = pd.Series([""]*len(df), index=df.index, dtype="object")
+                    css_col[m.fillna(False)] = f"background-color:{r['bg']}"
+                    styler = styler.apply(lambda s: css_col, subset=[col])
+    return styler
+
 with st.sidebar:
     st.header("Workbook")
-    uploaded = st.file_uploader("Upload Excel (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
-
+    uploaded = st.file_uploader("Upload Excel (.xlsx / .xlsm)", type=["xlsx","xlsm"])
     if uploaded is not None:
         dfs = load_excel_all_sheets(uploaded)
-        source_label = "Uploaded file"
-        local_path_for_styles = None
+        source_label="Uploaded file"; local_path=None
     else:
         if os.path.exists(DEFAULT_WORKBOOK):
             dfs = load_excel_all_sheets(DEFAULT_WORKBOOK)
-            source_label = f"Local file: {DEFAULT_WORKBOOK}"
-            local_path_for_styles = DEFAULT_WORKBOOK
+            source_label=f"Local file: {DEFAULT_WORKBOOK}"; local_path=DEFAULT_WORKBOOK
         else:
-            st.info("Upload an Excel file to get started.")
-            st.stop()
+            st.info("Upload an Excel file to get started."); st.stop()
     st.success(f"Loaded: {source_label}")
+    sheet_names=[s for s in dfs.keys() if s and s.lower() not in HIDDEN_SHEETS]
+    sheet=st.selectbox("Sheet", sorted(sheet_names))
+    mode=st.radio("View mode",["Filterable","Static Excel formatting","Conditional formatting (approx)"],index=0)
 
-    sheet_names = [s for s in dfs.keys() if s and s.lower() not in HIDDEN_SHEETS]
-    sheet = st.selectbox("Sheet", sorted(sheet_names))
-    show_styles = st.checkbox("Show Excel cell colors & fonts (slower)", value=False)
-    if show_styles:
-        st.caption("Styled view is a static snapshot (best for viewing formatting).")
-
-df = dfs[sheet].copy()
+df=dfs[sheet].copy()
 st.subheader(f"Sheet: {sheet}")
 st.write(f"Rows: **{len(df):,}** | Columns: **{len(df.columns)}**")
 
-with st.expander("Column overview", expanded=False):
-    st.dataframe(pd.DataFrame({"Column": df.columns, "dtype": [str(df[c].dtype) for c in df.columns]}))
-
-if show_styles:
+if mode=="Static Excel formatting":
     if uploaded is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsm") as tmp:
-            tmp.write(uploaded.getbuffer())
-            path_for_styles = tmp.name
-    else:
-        path_for_styles = local_path_for_styles
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".xlsm") as tmp:
+            tmp.write(uploaded.getbuffer()); path=tmp.name
+    else: path=local_path
     try:
-        if len(df) * max(1, len(df.columns)) > 150_000:
-            st.info("Sheet too large to render with styles; showing plain table instead.")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            vals_df, css_df = read_sheet_styles(path_for_styles, sheet)
-            styler = style_dataframe(vals_df, css_df)
-            st.dataframe(styler, use_container_width=True)
-            st.caption("Rendered with Excel formatting (solid fills, font color/bold/italic/underline).")
+        vals_df,css_df=read_sheet_styles(path,sheet)
+        styler=style_dataframe(vals_df,css_df)
+        st.dataframe(styler,use_container_width=True)
     except Exception as e:
-        st.warning(f"Could not render Excel styles for '{sheet}': {e}")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.warning(f"Static formatting failed: {e}"); st.dataframe(df)
     st.stop()
 
-# Filterable view
-q = st.text_input("Quick text search (matches any text column; case-insensitive)").strip()
-if q:
-    # pandas .str.contains
-    obj_cols = [c for c in df.columns if pd.api.types.is_object_dtype(df[c])]
-    if obj_cols:
-        mask = pd.Series(False, index=df.index)
-        for c in obj_cols:
-            mask = mask | df[c].astype(str).str.lower().str.contains(q, na=False)
-        df = df[mask]
+if mode=="Conditional formatting (approx)":
+    if uploaded is not None:
+        with tempfile.NamedTemporaryFile(delete=False,suffix=".xlsm") as tmp:
+            tmp.write(uploaded.getbuffer()); path=tmp.name
+    else: path=local_path
+    try:
+        wb=load_workbook(path,data_only=True); ws=wb[sheet]
+        styler=apply_cf_colors(df,ws)
+        if styler is None: st.info("No supported CF found"); st.dataframe(df)
+        else: st.dataframe(styler,use_container_width=True)
+    except Exception as e:
+        st.warning(f"CF failed: {e}"); st.dataframe(df)
+    st.stop()
 
-st.markdown("**Filters**")
-cols_left, cols_right = st.columns(2)
-
-num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-dt_cols  = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
-cat_cols = [c for c in df.columns if c not in num_cols and c not in dt_cols]
-
-with cols_left:
-    if cat_cols:
-        col_cat = st.selectbox("Categorical column", ["—"] + cat_cols, index=0)
-        if col_cat != "—":
-            uniques = df[col_cat].dropna().astype(str).unique().tolist()
-            uniques = sorted(uniques)
-            if len(uniques) > 3000:
-                st.info("Too many unique values; try text search instead.")
-            else:
-                selected_values = st.multiselect("Values", options=uniques)
-                if selected_values:
-                    df = df[df[col_cat].astype(str).isin(selected_values)]
-
-with cols_right:
-    if num_cols:
-        col_num = st.selectbox("Numeric column", ["—"] + num_cols, index=0)
-        if col_num != "—":
-            series = pd.to_numeric(df[col_num], errors="coerce")
-            min_v, max_v = float(series.min()), float(series.max())
-            if math.isfinite(min_v) and math.isfinite(max_v):
-                rng = st.slider("Range", min_value=min_v, max_value=max_v, value=(min_v, max_v))
-                df = df[series.between(rng[0], rng[1], inclusive="both")]
-    if dt_cols:
-        col_dt = st.selectbox("Datetime column", ["—"] + dt_cols, index=0)
-        if col_dt != "—":
-            df[col_dt] = pd.to_datetime(df[col_dt], errors="coerce")
-            min_d = pd.to_datetime(df[col_dt].min())
-            max_d = pd.to_datetime(df[col_dt].max())
-            if pd.notna(min_d) and pd.notna(max_d):
-                d1, d2 = st.date_input("Date range", value=(min_d.date(), max_d.date()))
-                if isinstance(d1, tuple):
-                    d1, d2 = d1
-                df = df[(df[col_dt] >= pd.to_datetime(d1)) & (df[col_dt] <= pd.to_datetime(d2))]
-
-st.divider()
-st.dataframe(df, use_container_width=True, hide_index=True)
-
-with st.expander("Quick stats (numeric columns)", expanded=False):
-    if num_cols:
-        st.dataframe(df[num_cols].describe().T)
-    else:
-        st.write("No numeric columns.")
-
-st.download_button("Download filtered CSV", data=df.to_csv(index=False).encode("utf-8"), file_name=f"{sheet}_filtered.csv")
-
-st.divider()
-st.subheader("Quick chart")
-if num_cols:
-    left, right = st.columns(2)
-    x_col = left.selectbox("X axis (categorical or numeric)", ["—"] + list(df.columns), index=0)
-    y_col = right.selectbox("Y axis (numeric)", ["—"] + num_cols, index=0)
-    if x_col != "—" and y_col != "—":
-        agg = st.selectbox("Aggregation", ["sum", "mean", "count", "min", "max"], index=1)
-        temp = df[[x_col, y_col]].copy()
-        if agg == "count":
-            temp["_ones"] = 1
-            grouped = temp.groupby(x_col)["_ones"].count().reset_index(name="count")
-            y_series = grouped["count"]
-            x_series = grouped[x_col]
-        else:
-            grouped = temp.groupby(x_col)[y_col].agg(agg).reset_index()
-            y_series = grouped[y_col]
-            x_series = grouped[x_col]
-        fig, ax = plt.subplots()
-        ax.plot(range(len(y_series)), y_series)
-        ax.set_xticks(range(len(x_series)))
-        ax.set_xticklabels([str(v) for v in x_series], rotation=45, ha="right")
-        ax.set_xlabel(str(x_col))
-        ax.set_ylabel(f"{agg}({y_col})")
-        ax.set_title(f"{agg} of {y_col} by {x_col}")
-        st.pyplot(fig, clear_figure=True)
-else:
-    st.info("Select a sheet with numeric columns to enable charting.")
+# Default filterable view
+st.dataframe(df,use_container_width=True)
